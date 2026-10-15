@@ -1464,6 +1464,7 @@ SYSDEF(fremovexattr) { /* (fd, name) */
  * all four hosts, so a size-tagged bounce is enough. */
 typedef struct { u32 cmd; u16 size; u8 dir; } IoctlEnt;   /* dir: 0 none/int-arg, 1 read(out), 2 write(in), 3 rw */
 #define IOC_TERMIOS_SZ 36   /* kernel struct termios: 4 u32 + c_line + c_cc[19] */
+#define IOC_TERMIOS2_SZ 44  /* kernel struct termios2: termios + 2 u32 speeds */
 static const IoctlEnt ioctl_tab[] = {
     { 0x5401 /*TCGETS*/,     IOC_TERMIOS_SZ, 1 },
     { 0x5402 /*TCSETS*/,     IOC_TERMIOS_SZ, 2 },
@@ -1565,6 +1566,42 @@ SYSDEF(ioctl) {
         } else if (nl_maybe_ifreq_ioctl(c, cmd, a2, &ret)) {
             return ret;
         }
+    }
+    /* termios2 (TCGETS2/TCSETS*2): glibc >= 2.42 implements tcgetattr/
+     * tcsetattr, and so isatty(), with these. They are served through the
+     * classic TCGETS/TCSETS* on the host: struct termios2 is struct termios
+     * (36 bytes, identical on every host) plus u32 c_ispeed/c_ospeed, and
+     * Android's SELinux tty ioctl allowlist admits only the classic calls.
+     * Speeds are derived from CBAUD on get; on set an arbitrary (BOTHER)
+     * rate is dropped to B38400 — a pty has no line speed anyway. */
+    if (cmd == 0x802c542a /*TCGETS2*/ || cmd == 0x402c542b /*TCSETS2*/ ||
+        cmd == 0x402c542c /*TCSETSW2*/ || cmd == 0x402c542d /*TCSETSF2*/) {
+        static const u32 bauds[] = { 0, 50, 75, 110, 134, 150, 200, 300, 600,
+            1200, 1800, 2400, 4800, 9600, 19200, 38400 };
+        static const u32 bauds_ex[] = { 0, 57600, 115200, 230400, 460800,
+            500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000,
+            2500000, 3000000, 3500000, 4000000 };
+        u8 t2[IOC_TERMIOS2_SZ];
+        u32 cflag;
+        if (cmd == 0x802c542a) {
+            memset(t2, 0, sizeof t2);
+            if (ioctl((int)a0, 0x5401 /*TCGETS*/, t2) < 0) return host_err();
+            memcpy(&cflag, t2 + 8, 4);
+            u32 cb = cflag & 0010017;
+            u32 sp = (cb & 0010000) ? bauds_ex[cb & 017] : bauds[cb & 017];
+            memcpy(t2 + 36, &sp, 4);
+            memcpy(t2 + 40, &sp, 4);
+            if (copy_to_guest(c, a2, t2, sizeof t2) < 0) return (u64)(s64)-EFAULT;
+            return 0;
+        }
+        if (copy_from_guest(c, t2, a2, sizeof t2) < 0) return (u64)(s64)-EFAULT;
+        memcpy(&cflag, t2 + 8, 4);
+        if ((cflag & 0010017) == 0010000 /*BOTHER*/) {
+            cflag = (cflag & ~0010017u) | 0000017 /*B38400*/;
+            memcpy(t2 + 8, &cflag, 4);
+        }
+        int r = ioctl((int)a0, 0x5402 + (cmd - 0x402c542b) /*TCSETS[W|F]*/, t2);
+        return r < 0 ? host_err() : 0;
     }
     const IoctlEnt *e = NULL;
     for (size_t i = 0; i < sizeof ioctl_tab / sizeof ioctl_tab[0]; i++)
